@@ -40,6 +40,13 @@ import shutil
 import sys
 from pathlib import Path
 
+# Windows 콘솔 기본 인코딩(cp949/cp1252)에서는 한글 출력이 UnicodeEncodeError 로 죽는다.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, OSError, ValueError):
+        pass
+
 # ---------------------------------------------------------------------------
 # 유니버스 — portfolio-dashboard.html 의 UNIVERSE 배열과 티커/순서를 맞춘다.
 # (세 번째 항목 = 대시보드 좌측 레일의 카테고리 그룹)

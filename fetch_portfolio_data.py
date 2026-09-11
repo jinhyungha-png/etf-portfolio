@@ -9,7 +9,10 @@
 ------------------------------------------------
     window.PRICES = { "<TICKER>": [ <138개 값>, ... ], ... }
 
-    - 배열 인덱스 0 = 2015-01, 인덱스 137 = 2026-06 (총 138개월, 고정 격자)
+    - 배열 인덱스 0 = 2015-01, 이후 --end 월까지 월별 1칸 (기본 --end = 실행한 달)
+    - 실행한 달이 아직 끝나지 않았으면 마지막 칸은 최근 거래일 종가인 부분월이며,
+      window.PRICES_META = {start, end, months, asof, partial} 에 그 날짜가 함께 기록된다.
+      대시보드는 배열 길이로 월 축을 정하므로 다시 실행하기만 하면 기간이 늘어난다.
     - 상장 이전(또는 데이터 없음) 구간은 반드시 null
     - 값은 배당 재투자를 반영한 조정종가. 대시보드는 월간 수익률
       (a[t]/a[t-1]-1)만 사용하므로 절대 수준·스케일은 의미가 없다.
@@ -21,7 +24,7 @@
     pip install yfinance pandas
     python fetch_portfolio_data.py                          # prices.json + prices.js
     python fetch_portfolio_data.py --inject portfolio-dashboard.html
-    python fetch_portfolio_data.py --start 2015-01 --end 2026-06 --out-dir data/
+    python fetch_portfolio_data.py --end 2026-08 --out-dir data/   # 완결된 달까지만
 
 --inject 를 주면 대시보드 HTML 안에 window.PRICES 블록을 직접 삽입/교체한다
 (기존 블록이 있으면 덮어씀). 원본은 .bak 으로 백업한다.
@@ -33,6 +36,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import math
 import re
@@ -77,8 +81,8 @@ UNIVERSE = [
 
 TICKERS = [t for t, _, _ in UNIVERSE]
 
-DEFAULT_START = "2015-01"
-DEFAULT_END = "2026-06"
+DEFAULT_START = "2015-01"  # 대시보드 월 축의 기준점(idxOf)과 같아야 하므로 --inject 시 고정
+DEFAULT_END = datetime.date.today().strftime("%Y-%m")  # 실행한 달 = 가능한 가장 최신
 
 INJECT_START = "<!-- BEGIN real-prices (fetch_portfolio_data.py) -->"
 INJECT_END = "<!-- END real-prices -->"
@@ -167,6 +171,19 @@ def download_monthly(tickers: list, start: str, end: str, retries: int = 3):
     return close
 
 
+def latest_trading_date(ticker: str = "VOO"):
+    """가장 최근 거래일('YYYY-MM-DD'). 조회에 실패하면 None."""
+    try:
+        import yfinance as yf
+
+        d = yf.download(ticker, period="10d", interval="1d", auto_adjust=True, progress=False)
+        if d is None or d.empty:
+            return None
+        return d.dropna(how="all").index[-1].strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
 def to_grid(close, grid: list) -> dict:
     """DataFrame -> {ticker: [값 or None] * len(grid)}. 상장 이전 구간은 None 유지."""
     out = {}
@@ -196,7 +213,7 @@ def to_grid(close, grid: list) -> dict:
 # ---------------------------------------------------------------------------
 # 출력
 # ---------------------------------------------------------------------------
-def render_js(prices: dict, grid: list) -> str:
+def render_js(prices: dict, grid: list, meta: dict) -> str:
     body = ",\n".join(
         '  "%s": %s' % (tk, json.dumps(prices[tk], ensure_ascii=False))
         for tk in TICKERS
@@ -205,7 +222,11 @@ def render_js(prices: dict, grid: list) -> str:
         "/* 자동 생성: fetch_portfolio_data.py — 손으로 고치지 마세요.\n"
         "   월 격자: %s ~ %s (%d개월), null = 상장 이전 */" % (grid[0], grid[-1], len(grid))
     )
-    return "<script>\n%s\nwindow.PRICES = {\n%s\n};\n</script>\n" % (header, body)
+    return "<script>\n%s\nwindow.PRICES_META = %s;\nwindow.PRICES = {\n%s\n};\n</script>\n" % (
+        header,
+        json.dumps(meta, ensure_ascii=False),
+        body,
+    )
 
 
 def inject(html_path: Path, block: str) -> None:
@@ -254,6 +275,14 @@ def main() -> int:
     ap.add_argument("--inject", metavar="HTML", help="이 HTML 에 window.PRICES 직접 주입")
     args = ap.parse_args()
 
+    if args.end > DEFAULT_END:
+        raise SystemExit("--end(%s) 가 이번 달(%s) 보다 미래입니다." % (args.end, DEFAULT_END))
+    if args.inject and args.start != DEFAULT_START:
+        raise SystemExit(
+            "--inject 는 --start %s 에서만 쓸 수 있습니다 (대시보드 월 축이 %s 기준)."
+            % (DEFAULT_START, DEFAULT_START)
+        )
+
     grid = month_grid(args.start, args.end)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -263,14 +292,25 @@ def main() -> int:
     prices = to_grid(close, grid)
     report(prices, grid)
 
+    partial = grid[-1] == DEFAULT_END  # 이번 달은 아직 끝나지 않았다
+    meta = {
+        "start": grid[0],
+        "end": grid[-1],
+        "months": len(grid),
+        "asof": latest_trading_date() if partial else None,
+        "partial": partial,
+    }
+    if partial:
+        print("\n  마지막 달 %s 는 %s 종가까지의 부분월입니다." % (grid[-1], meta["asof"] or "최근 거래일"))
+
     json_path = out_dir / "prices.json"
     json_path.write_text(
-        json.dumps({"months": grid, "prices": prices}, ensure_ascii=False, indent=1),
+        json.dumps({"meta": meta, "months": grid, "prices": prices}, ensure_ascii=False, indent=1),
         encoding="utf-8",
     )
     print("\n  %s" % json_path)
 
-    js_block = render_js(prices, grid)
+    js_block = render_js(prices, grid, meta)
     js_path = out_dir / "prices.js"
     js_path.write_text(js_block, encoding="utf-8")
     print("  %s" % js_path)
